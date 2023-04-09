@@ -1,0 +1,4 @@
+CreateProcess
+CloseHandle
+ContinueDebugEvent
+WaitForDebugEventEx
