@@ -1,4 +1,6 @@
 CreateProcess
 CloseHandle
 ContinueDebugEvent
+GetThreadContext
+OpenThread
 WaitForDebugEventEx

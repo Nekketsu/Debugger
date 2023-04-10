@@ -1,4 +1,6 @@
-﻿using System.Diagnostics;
+﻿using Debugger.Commands;
+using Debugger.Models;
+using System.Diagnostics;
 using System.Runtime.InteropServices;
 using Windows.Win32;
 using Windows.Win32.Foundation;
@@ -6,50 +8,122 @@ using Windows.Win32.System.Diagnostics.Debug;
 using Windows.Win32.System.Threading;
 
 
-void MainDebuggerLoop()
+const int DBG_CONTINUE = 10002;
+const int DBG_EXCEPTION_NOT_HANDLED = unchecked((int)0x80010001L);
+const int EXCEPTION_SINGLE_STEP = unchecked((int)0x80000004);
+
+void MainDebuggerLoop(HANDLE process)
 {
+    var context = new Context();
+    context.ExpectStepException = false;
     while (true)
     {
         PInvoke.WaitForDebugEventEx(out var debugEvent, uint.MaxValue);
+        context.ContinueStatus = new NTSTATUS(DBG_CONTINUE);
 
-        var text = debugEvent.dwDebugEventCode switch
+        switch (debugEvent.dwDebugEventCode)
         {
-            DEBUG_EVENT_CODE.EXCEPTION_DEBUG_EVENT => "Exception",
-            DEBUG_EVENT_CODE.CREATE_THREAD_DEBUG_EVENT => "CreateThread",
-            DEBUG_EVENT_CODE.CREATE_PROCESS_DEBUG_EVENT => "CreateProcess",
-            DEBUG_EVENT_CODE.EXIT_THREAD_DEBUG_EVENT => "ExitThread",
-            DEBUG_EVENT_CODE.EXIT_PROCESS_DEBUG_EVENT => "ExitProcess",
-            DEBUG_EVENT_CODE.LOAD_DLL_DEBUG_EVENT => "LoadDll",
-            DEBUG_EVENT_CODE.UNLOAD_DLL_DEBUG_EVENT => "UnloadDll",
-            DEBUG_EVENT_CODE.OUTPUT_DEBUG_STRING_EVENT => "OutputDebugString",
-            DEBUG_EVENT_CODE.RIP_EVENT => "RipEvent",
-            _ => throw new Exception("Unexpected debug event")
+            case DEBUG_EVENT_CODE.EXCEPTION_DEBUG_EVENT:
+                var code = debugEvent.u.Exception.ExceptionRecord.ExceptionCode;
+                var firstChance = debugEvent.u.Exception.dwFirstChance;
+                var chanceString = firstChance == 0
+                    ? "second chance"
+                    : "first chance";
+
+                if (context.ExpectStepException && code.Value == EXCEPTION_SINGLE_STEP)
+                {
+                    context.ExpectStepException = false;
+                    context.ContinueStatus = new NTSTATUS(DBG_CONTINUE);
+                }
+                else
+                {
+                    Console.WriteLine($"Exception code {code:x} ({chanceString})");
+                    context.ContinueStatus = new NTSTATUS(DBG_EXCEPTION_NOT_HANDLED);
+                }
+
+                break;
+            case DEBUG_EVENT_CODE.CREATE_THREAD_DEBUG_EVENT:
+                Console.WriteLine("CreateThread");
+                break;
+            case DEBUG_EVENT_CODE.CREATE_PROCESS_DEBUG_EVENT:
+                Console.WriteLine("CreateProcess");
+                break;
+            case DEBUG_EVENT_CODE.EXIT_THREAD_DEBUG_EVENT:
+                Console.WriteLine("ExitThread");
+                break;
+            case DEBUG_EVENT_CODE.EXIT_PROCESS_DEBUG_EVENT:
+                Console.WriteLine("ExitProcess");
+                break;
+            case DEBUG_EVENT_CODE.LOAD_DLL_DEBUG_EVENT:
+                Console.Write("LoadDll");
+                break;
+            case DEBUG_EVENT_CODE.UNLOAD_DLL_DEBUG_EVENT:
+                Console.WriteLine("UnloadDll");
+                break;
+            case DEBUG_EVENT_CODE.OUTPUT_DEBUG_STRING_EVENT:
+                Console.WriteLine("OutputDebugString");
+                break;
+            case DEBUG_EVENT_CODE.RIP_EVENT:
+                Console.WriteLine("RipEvent");
+                break;
+            default:
+                throw new Exception("Unexpected debug event");
         };
 
-        Console.WriteLine(text);
+        var thread = PInvoke.OpenThread_SafeHandle(THREAD_ACCESS_RIGHTS.THREAD_GET_CONTEXT | THREAD_ACCESS_RIGHTS.THREAD_SET_CONTEXT,
+            false,
+            debugEvent.dwThreadId);
+
+        var threadContext = new CONTEXT64();
+        threadContext.ContextFlags = CONTEXT_FLAGS.CONTEXT_ALL;
+        var result = PInvoke.GetThreadContext(thread.DangerousGetHandle(), ref threadContext);
+
+        if (!result)
+        {
+            var error = Marshal.GetLastWin32Error();
+            throw new Exception($"GetThreadContext failed ({error})");
+        }
+
+        context.ContinueExecution = false;
+
+        while (!context.ContinueExecution)
+        {
+            Console.WriteLine($"[{debugEvent.dwThreadId:X}] 0x{context.ThreadContext.Rip:x16}");
+
+            var command = Command.ReadCommand(context);
+            if (command is not null)
+            {
+                command.Handle();
+                if (context.Quit)
+                {
+                    // The process will be terminated since we didn't detach.
+                    return;
+                }
+            }
+        }
 
         if (debugEvent.dwDebugEventCode == DEBUG_EVENT_CODE.EXIT_PROCESS_DEBUG_EVENT)
         {
             break;
         }
 
-        const int DBG_EXCEPTION_NOT_HANDLED = unchecked((int)0X80010001);
         PInvoke.ContinueDebugEvent(
             debugEvent.dwProcessId,
             debugEvent.dwThreadId,
-            new NTSTATUS(DBG_EXCEPTION_NOT_HANDLED)
+            new NTSTATUS(context.ContinueStatus)
         );
     }
 }
 
 var startupInfo = new STARTUPINFOW();
 startupInfo.cb = (uint)Marshal.SizeOf<STARTUPINFOW>();
+args = new[] { "cmd" }; 
 if (!args.Any())
 {
     Console.WriteLine($"Usage: {AppDomain.CurrentDomain.FriendlyName} <Debuggee>");
     return;
 }
-Console.WriteLine(args.First());
+
 var commandLine = args.First().Append((char)0).ToArray().AsSpan();
 
 unsafe
@@ -74,7 +148,7 @@ unsafe
 
     PInvoke.CloseHandle(processInformation.hThread);
 
-    MainDebuggerLoop();
+    MainDebuggerLoop(processInformation.hProcess);
 
     PInvoke.CloseHandle(processInformation.hProcess);
 }
